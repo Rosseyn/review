@@ -1,2 +1,2 @@
 /target
-Cargo.lock
+# Cargo.lock is committed: this workspace ships a binary, so we want reproducible builds.

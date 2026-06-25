@@ -1,0 +1,14 @@
+# Config for the `cross` tool (Docker-based cross-compilation). See DEVICE.md.
+#
+#   cargo install cross
+#   cross build --release --target armv7-unknown-linux-gnueabihf --features device -p rmbrowser
+#
+# Note the glibc-compatibility caveat in DEVICE.md: the stock cross image links a newer
+# glibc than the RM2 ships. If the device rejects the binary, use the reMarkable OE SDK
+# toolchain or the musl target instead.
+
+[target.armv7-unknown-linux-gnueabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:0.2.5"
+
+[build]
+default-target = "armv7-unknown-linux-gnueabihf"

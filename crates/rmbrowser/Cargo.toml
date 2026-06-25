@@ -8,6 +8,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Build the real RM2 device backend (rm2fb via libremarkable). See DEVICE.md.
+device = ["rmb-hal/device"]
+
 [dependencies]
 rmb-types = { path = "../rmb-types" }
 rmb-display = { path = "../rmb-display" }

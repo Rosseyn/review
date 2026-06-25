@@ -8,6 +8,18 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Enables the on-device rm2fb backend (RM2). Off by default so the host build stays
+# pure and testable; turning it on pulls in libremarkable. See DEVICE.md.
+device = ["dep:libremarkable"]
+
 [dependencies]
 rmb-types = { path = "../rmb-types" }
 rmb-display = { path = "../rmb-display" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libremarkable = { version = "0.7", optional = true, default-features = false, features = [
+    "framebuffer",
+    "framebuffer-storage",
+    "framebuffer-drawing",
+] }

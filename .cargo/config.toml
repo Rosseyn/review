@@ -1,0 +1,12 @@
+# Cross-compilation defaults for the reMarkable 2 (Cortex-A7, armv7 hard-float).
+#
+# The host build (x86_64) is unaffected — this section only applies when building the
+# armv7-unknown-linux-gnueabihf target. See DEVICE.md for the full toolchain story.
+[target.armv7-unknown-linux-gnueabihf]
+# Provided by your cross toolchain. If you build with the `cross` tool (recommended, see
+# DEVICE.md) this is supplied by the container and you can ignore the absence locally.
+linker = "arm-linux-gnueabihf-gcc"
+rustflags = [
+    "-C", "target-cpu=cortex-a7",
+    "-C", "target-feature=+neon,+vfp4",
+]

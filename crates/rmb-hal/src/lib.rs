@@ -176,14 +176,11 @@ pub mod mxcfb {
     }
 }
 
-pub mod rm2fb {
-    //! reMarkable 2 framebuffer backend over `/swtfb.01` + SysV message queue (PLAN.md §4).
-    //!
-    //! The RM2-first device target. To be implemented against `libremarkable` behind a
-    //! `device` feature: mmap the RGB565 shm, `blit` region rows into it, and enqueue an
-    //! `mxcfb_update_data` (built via [`super::mxcfb`]) over the message queue; `wait`
-    //! blocks on the update marker. Kept as a scaffold until on-device.
-}
+/// reMarkable 2 framebuffer backend over rm2fb (`/dev/shm/swtfb.01` + SysV message queue).
+/// Implemented against `libremarkable` 0.7; only built under the `device` feature so the
+/// host workspace stays free of the device dependency (PLAN.md §4, DEVICE.md).
+#[cfg(feature = "device")]
+pub mod rm2fb;
 
 pub mod mxcfb_direct {
     //! Direct kernel EPDC framebuffer backend (Pro/Move/Pure). Scaffold — primary devices.
