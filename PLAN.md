@@ -246,8 +246,9 @@ difference so the primary build is uniform and RM2 is optional.
                          │                   ▼                            │
                          │   PixelPipeline (one trait, two renderers):    │
                          │     ├─ Mono(Carta): grey quantize + SW dither  │
-                         │     ├─ Color(Gallery3): gamut map → HW/panel   │
-                         │     │                    dithering (minimal SW)│
+                         │     ├─ Color(Gallery3): gamut+auto-contrast →   │
+                         │     │    SW dither (ordered); panel = synthesis │
+                         │     │    only; PxP offload on Move if exposed   │
                          │     └─ waveform FSM (mode select, ghost flush) │
                          │                   ▼                            │
                          │   DisplayBackend: mxcfb-direct | rm2fb          │
@@ -268,7 +269,7 @@ crates/
   rmb-hal          DisplayBackend (mxcfb-direct | rm2fb), panel/frontlight probe
   rmb-pixel-core   shared PixelPipeline trait, RGBA surface, dirty-rect & LUT helpers
   rmb-pixel-mono   Mono renderer (Carta): greyscale quantize + dither   (Pure, RM2)
-  rmb-pixel-color  Color renderer (Gallery 3): gamut map + panel-side dithering (Pro, Move)
+  rmb-pixel-color  Color renderer (Gallery 3): gamut/auto-contrast + SW dither; opt. PxP (Pro, Move)
   rmb-display      waveform FSM (mono modes + color refresh classes), update dispatch
   rmb-compositor   page⊕overlay merge, dirty-rect tracking
   rmb-input        evdev → gestures → Intents
@@ -368,17 +369,54 @@ color builds on.
 
 A gamma-aware sRGB→linear→16-level LUT is precomputed once.
 
-### 8.2 Color panels (Pro, Move) — Gallery 3 quantization  **[COMPLEXITY: HIGH]**
-Critical caution: **the Gallery 3 panel dithers CMY+W pigment in-panel itself.** Naively
-applying our own error-diffusion on top ("double-dithering") plus the slow color waveform
-is the documented cause of muddy, washed-out Gallery 3 output. Therefore:
-- Render RGBA, then apply **conservative, palette-aware quantization** to reMarkable's
-  ~20k-color working set; prefer letting the panel do final synthesis rather than
-  aggressive client error-diffusion.
-- Keep a **grayscale fast-path** for text/scroll (drive the mono partial mode), engaging
-  color only on static paint.
-- Color waveform mode IDs / exact pixel format on Gallery 3 are **not publicly
-  documented** — must be reverse-engineered/validated on-device (risk, §17).
+### 8.2 Color panels (Pro, Move) — Gallery 3 pipeline  **[COMPLEXITY: HIGH]**
+
+**Correction to an earlier assumption (important).** There is **no free hardware dithering
+offload** on these devices. What the panel/TCON does for free is **waveform generation +
+CMYW pigment color *synthesis*** — landing the four-particle (White/Cyan/Magenta/Yellow)
+ink to realize a pixel's target color. That is the part we must **not** replicate. But
+**spatial dithering is *not* free and is the host's job:** each Gallery 3 pixel resolves to
+only **8 solid colors** (K, R, G, B, C, M, Y, W); the ~20,000 perceived shades exist
+**only via spatial dithering across pixels**, and on the i.MX8M Mini (Paper Pro) there is
+**no EPDC peripheral at all** to do it. reMarkable's own stack (closed, inside
+`QsgEpaperPlugin`/xochitl) does it in software: **auto-contrast → quantize to a fixed
+palette → dither**, confirmed by the wavexx reverse-engineering of the Paper Pro. So the
+muddy/washed-out reputation comes from naive sRGB→panel mapping into a narrow,
+low-saturation gamut — not from "double dithering" per se, though double-dithering is a
+real, separate hazard to avoid.
+
+**Division of labor — what the host (us) MUST compute (no offload on Paper Pro):**
+1. **Gamut + gamma map** sRGB → the panel's measured primaries, **perceptual intent** to
+   avoid washout. Reuse/refine the wavexx-measured ICC primaries as the target (a small 3D
+   LUT or matrix+gamma). This is the single biggest correctness lever.
+2. **Global auto-contrast / tone map** (cheap level stretch) — the biggest *visual* win per
+   CPU cycle against the muddy-color problem.
+3. **Quantize + dither to the 8-color palette.** Two-tier, mirroring mono (§8.1) and reusing
+   the same `rmb-pixel-core` dither code:
+   - **Ordered / blue-noise — default.** O(1)/pixel, NEON-vectorizable, stable across
+     partial redraws. Right for text/UI/static color and the CPU budget.
+   - **Error-diffusion (serpentine Floyd–Steinberg/Atkinson) — high-value images only.**
+     Sequential and costly; accumulate error in a **≥8-bit working buffer** to avoid banding.
+4. **Pack** to the panel's expected indexed/bit-depth format.
+
+**What the panel does for free (do NOT redo):** waveform + CMYW color synthesis only.
+
+**Opportunistic hardware offload — Move (i.MX93) ONLY:** the i.MX93 has a **PxP** engine
+with an EPDC path that *can* do colorspace conversion, rotation, and **ORDERED** quantize
+as a DMA-class pass — offloading work off the dual A55 **if reMarkable exposes the ioctl**.
+Treat as opportunistic, probed at runtime, never assumed. **Paper Pro cannot do this (no
+EPDC); error-diffusion is never hardware-offloaded anywhere** (it's the mode HW omits).
+
+**Pitfalls:** (a) **double-dithering** — if reMarkable's compositor or any driver stage
+applies its own dither, ours must be the only one (request a passthrough/no-second-dither
+path); (b) **banding** from quantizing a low-bit buffer — always diffuse in high precision;
+(c) keep the **mono/grey fast-path** for text/scroll, engaging color only on static paint
+(color waveforms are 500–1500 ms, §4).
+
+**On-device unknowns to resolve (risk, §17):** exact color framebuffer pixel format
+reMarkable's compositor accepts; whether it applies its own dither (double-dither check);
+whether Move exposes PxP dithering ioctls; the panel's true measured primaries (start from
+the wavexx profile).
 
 ### 8.3 Draw modes to support out of the gate
 Mono: GC16 (P0), DU (P0), INIT (P0), A2 (P1), GL16/GLR16 (P1), DU4 (P2), AUTO (P2).
@@ -566,8 +604,9 @@ capability registry defines per API `{ Absent | Stub-reject | Static-fallback }`
 | Item | Complexity | Risk | Mitigation |
 |---|---|---|---|
 | WPE WebKit aarch64 cross-compile + headless backend + Rust FFI | HIGH | MED | No turnkey binding; isolate behind `RenderEngine`; 64-bit + 2 GB eases vs RM2 |
-| **Gallery 3 color path** (waveform IDs, pixel format, libremarkable maturity) | **HIGH** | **HIGH** | Least-documented frontier; reverse-engineer on-device; ship mono-correct first, color second |
-| **Double-dithering** muddiness on Gallery 3 | MED | **HIGH** | Conservative palette-aware quantization; let panel self-dither; grayscale reader option |
+| **Gallery 3 color path** (no HW dither offload on Paper Pro — i.MX8M Mini has no EPDC; waveform IDs, pixel format, true primaries undocumented) | **HIGH** | **HIGH** | Host does gamut-map + auto-contrast + dither on CPU (NEON); reuse wavexx ICC primaries; reverse-engineer on-device; ship mono first, color second |
+| **Muddy/washed-out color** (narrow gamut) + double-dithering | MED | **HIGH** | Perceptual gamut map + global auto-contrast; ensure ours is the only dither (passthrough); grayscale reader option |
+| **PxP offload on Move not guaranteed** | LOW | LOW | Probe i.MX93 PxP ioctl at runtime; fall back to CPU ordered dither; Paper Pro is CPU-only regardless |
 | Refresh-mode FSM "feels instant" (now with color axis) | MED | MED | On-device tuning pass (§18); hysteresis |
 | A2/DU ghosting management | MED | MED | Ghost budget + GC16/INIT flush + white-frame padding |
 | **RM2 = WPE on armv7 + rm2fb in 1 GB** (Option C) | MED | **HIGH** | Validate the 1 GB memory budget early; aggressive WPE caps, single-tab, reader-default, mono-only; NetSurf (Option B) as contingency |
@@ -593,9 +632,10 @@ capability registry defines per API `{ Absent | Stub-reject | Static-fallback }`
   RAM caps; cookies/TLS policy (`rmb-net`); zoom; basic forms/login. *Exit:* a real login
   page renders and submits.
 - **Phase 3 — Color renderer (Gallery 3), reusing the mono core.** Build `rmb-pixel-color`
-  on the shared scaffolding + §7 FSM; reverse-engineer/validate color waveforms and
-  panel/controller-side dithering on Pro/Move; gamut-map host-side, push dithering to the
-  hardware (§8.2); color in the FSM (static-paint only). *Exit:* color pages render cleanly
+  on the shared scaffolding + §7 FSM; reverse-engineer/validate color waveforms and the
+  framebuffer format on Pro/Move; host-side gamut map + auto-contrast + efficient ordered
+  dither (reusing mono's dither core), with opportunistic PxP offload on Move; color in the
+  FSM (static-paint only). *Exit:* color pages render cleanly
   without muddiness; scroll stays mono-fast. (Launch priority alongside mono, built second.)
 - **Phase 4 — Viewer UX.** Virtual buttons (placement, actions, orientation anchoring,
   toggle); link drawer + fast-nav; reader mode + stylesheet + controls; TOC/landmark jump;
@@ -638,7 +678,12 @@ linux-imx-rm` kernel (codenames `ferrari`/`chiappa`/`tatsu`, `ARCH=arm64`); NXP 
 Good e-Reader & CNX (Gallery 3 / ACeP, refresh times); E Ink Gallery 3 brand page.
 Display stack: `libremarkable` (RMPP support), `ddvk/remarkable2-framebuffer` (rm2fb, RM2-
 only), remarkablewiki SWTCON, remarkable.guide display, FBInk PR #41 (mono waveform
-latencies). Engines: WPE/WebKitGTK Skia CPU default (Igalia, wpewebkit.org 2.46);
+latencies). Color dithering / Gallery 3: FBInk `mxcfb-kobo.h` (`mxcfb_dithering_mode` enum,
+v2 struct) & `mxc_epdc_v2_fb.c` (PxP/CPU dithering, not EPDC-core silicon); NXP community
+"i.MX8M Mini has no EPDC"; NXP i.MX93 RM / Linux release notes (PxP-for-EPDC); E Ink
+Gallery 3 brand page (CMYW, 8 colors, dithering for shades); **wavexx "Remarkable Pro
+Colors"** (host-side auto-contrast→quantize→dither, measured ICC primaries); Modos
+Labs Glider/Caster (host-RGB→controller-dither reference architecture). Engines: WPE/WebKitGTK Skia CPU default (Igalia, wpewebkit.org 2.46);
 Ultralight ARM64 1.4 + pricing (ultralig.ht); Servo WebRender GLES3 requirement & libservo
 software-backend proposals (servo/webrender #3701, servo #18597/#35083); Blitz / anyrender
 / vello_cpu (DioxusLabs, Linebender); CEF OSR software rendering. Features: Netscape
