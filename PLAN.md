@@ -100,36 +100,36 @@ Given those seams, device support reduces to a **build matrix**:
 
 | Build | Targets | Arch | Display | Pixel | Engine | Notes |
 |---|---|---|---|---|---|---|
-| **Primary** | Pro, Move, Pure | aarch64 | mxcfb-direct | Color *or* Mono (runtime-detected) | WPE (default) | 2 GB, the real product |
-| **RM2 (optional)** | RM2 | armv7 | rm2fb | Mono | see options below | 1 GB, degraded, separate target |
+| **Primary** | Pro, Move, Pure | aarch64 | mxcfb-direct | Mono *and* Color (separate renderers; panel-detected at runtime) | WPE (default) | 2 GB, the real product |
+| **RM2 (kept)** | RM2 | armv7 | rm2fb | Mono | **WPE (armv7)** | 1 GB, degraded but same engine — Option C |
 
-A single aarch64 binary serves all three primary devices; color vs mono is detected at
-runtime from the panel. RM2 is a *separate compile* (different target triple, `rm2fb`
-dependency, tighter memory budget) gated behind a cargo feature so it never burdens the
-primary build.
+A single aarch64 binary serves all three primary devices; the **mono** and **color**
+renderers are separate implementations (§8) selected at runtime from the detected panel.
+RM2 is a *separate compile* (different target triple, `rm2fb` dependency, tighter memory
+budget) gated behind a cargo feature so it never burdens the primary build.
 
-### RM2 options (the user's explicit question: degraded build vs drop)
+### RM2 disposition — DECIDED: keep RM2 via Option C
 
-Because the engine sits behind `RenderEngine`, RM2 has three viable dispositions:
+RM2 is **kept** as a supported, if degraded, target. Of the three dispositions the
+`RenderEngine` seam allows, we commit to **Option C**:
 
-- **Option A — Drop RM2 (recommended default).** It is discontinued, 32-bit, 1 GB, and
-  the weakest CPU. The abstraction seams mean dropping it costs the primary build
-  **nothing**. Choose this unless there is real demand for RM2 support.
-- **Option B — Degraded RM2 reader build via NetSurf + rm2fb.** NetSurf is tiny (tens of
-  MB), **already ported to the RM2**, and runs comfortably in 1 GB on the A7. Behind the
-  `RenderEngine` trait it becomes a "reader/static" engine. Cost: **weak JS (Duktape,
-  ES5) → no modern OAuth logins on RM2**, reduced CSS. This is the most realistic
-  "degraded version with workarounds" if RM2 must ship. Reader mode (§12) carries most
-  of the value here.
-- **Option C — Same WPE engine on armv7 + rm2fb.** WPE builds for both arm32 and arm64,
-  so maximum code sharing and logins-on-RM2 are *theoretically* possible. But WPE in
-  1 GB on a dual-A7 with the rm2fb shim is the riskiest path (memory pressure, latency);
-  treat as a stretch goal, not a baseline.
+- **Option C — Same WPE engine on armv7 + rm2fb (CHOSEN).** WPE builds for both arm32 and
+  arm64, so RM2 reuses the *same engine and almost all of the codebase* as the primary
+  build — only the target triple, the `rm2fb` `DisplayBackend`, the mono `PixelPipeline`,
+  and tighter memory tuning differ. This keeps **login compatibility on RM2** and avoids a
+  second engine integration. The cost is real and accepted: WPE in 1 GB on a dual-A7
+  behind the rm2fb shim means heavier memory pressure and higher latency, so RM2 leans
+  hardest on aggressive `WPE_RAM_SIZE`/MemoryPressureSettings caps, single-tab operation,
+  reader mode by default, and the mono fast-refresh path. We validate the 1 GB budget
+  early (see §17/§18) and fall back to Option B only if WPE proves unviable there.
+- **Option B — NetSurf + rm2fb (fallback only).** NetSurf is tiny and already ported to
+  RM2, but its weak Duktape JS means **no modern logins**. Kept as a contingency behind the
+  same `RenderEngine` trait (crate `rmb-engine-net`) if Option C can't fit 1 GB.
+- **Option A — Drop RM2.** No longer the plan; retained only as the ultimate fallback if
+  neither C nor B is acceptable.
 
-**Recommendation:** build the abstraction now, ship the **Primary (aarch64)** build
-first, and treat RM2 as **Option A (drop)** unless asked — with **Option B (NetSurf
-reader)** as the fallback if a degraded RM2 build is required. The seams guarantee this
-is a late, low-risk decision.
+Because RM2 shares the engine and all the application layers, keeping it costs the primary
+build little — the deltas are confined to the HAL seams.
 
 ---
 
@@ -244,8 +244,10 @@ difference so the primary build is uniform and RM2 is optional.
                          │                   ▼                            │
                          │   compositor: overlay ⊕ page → dirty rects     │
                          │                   ▼                            │
-                         │   PixelPipeline:  Color(Gallery3) | Mono(Carta)│
-                         │     ├─ quantize/dither (palette- or grey-aware)│
+                         │   PixelPipeline (one trait, two renderers):    │
+                         │     ├─ Mono(Carta): grey quantize + SW dither  │
+                         │     ├─ Color(Gallery3): gamut map → HW/panel   │
+                         │     │                    dithering (minimal SW)│
                          │     └─ waveform FSM (mode select, ghost flush) │
                          │                   ▼                            │
                          │   DisplayBackend: mxcfb-direct | rm2fb          │
@@ -264,21 +266,24 @@ difference so the primary build is uniform and RM2 is optional.
 crates/
   rmbrowser        app shell, config, device detection, lifecycle
   rmb-hal          DisplayBackend (mxcfb-direct | rm2fb), panel/frontlight probe
-  rmb-pixel        PixelPipeline: Color(Gallery3) & Mono(Carta), dither/quantize
-  rmb-display      waveform FSM (mono + color classes), update dispatch
+  rmb-pixel-core   shared PixelPipeline trait, RGBA surface, dirty-rect & LUT helpers
+  rmb-pixel-mono   Mono renderer (Carta): greyscale quantize + dither   (Pure, RM2)
+  rmb-pixel-color  Color renderer (Gallery 3): gamut map + panel-side dithering (Pro, Move)
+  rmb-display      waveform FSM (mono modes + color refresh classes), update dispatch
   rmb-compositor   page⊕overlay merge, dirty-rect tracking
   rmb-input        evdev → gestures → Intents
   rmb-engine       RenderEngine trait + impls
-  rmb-engine-wpe   FFI to libwpe + headless backend  (feature: engine-wpe)
-  rmb-engine-net   NetSurf FFI                        (feature: engine-netsurf, RM2)
+  rmb-engine-wpe   FFI to libwpe + headless backend  (feature: engine-wpe; all devices incl. RM2)
+  rmb-engine-net   NetSurf FFI — RM2 fallback only    (feature: engine-netsurf)
   rmb-overlay      virtual buttons, link drawer, reader UI, TOC/landmark menu
   rmb-nav          link-drawer scoring, semantic fast-nav, zoom model
   rmb-reader       Readability-style extraction + reader stylesheet
   rmb-bookmarks    Netscape-HTML / Chromium-JSON / places.sqlite importers
   rmb-net          HTTPS/HTTP policy, TLS (rustls), cookie jar
 ```
-Build features select arch/display/engine: primary = `aarch64 + mxcfb + engine-wpe`;
-RM2 = `armv7 + rm2fb + engine-netsurf` (or `engine-wpe`).
+Build features select arch/display/engine: primary = `aarch64 + mxcfb + engine-wpe` with
+both `pixel-mono` and `pixel-color`; RM2 = `armv7 + rm2fb + engine-wpe` with `pixel-mono`
+only (`engine-netsurf` is the fallback if WPE can't fit 1 GB).
 
 ---
 
@@ -341,7 +346,17 @@ color/mono thresholds need empirical tuning; "feels instant" is iterative.
 
 ## 8. Rendering quality: dithering, color quantization, waveforms & hi-fi  *(Emphasis #3)*
 
-The engine renders full RGBA; `rmb-pixel` maps it to the panel.
+The engine renders full RGBA; a `PixelPipeline` maps it to the panel. **Mono and color
+are two substantially different renderers, not one parameterized path** — they differ in
+bit depth, dithering strategy, waveform classes, and (crucially) in how much work is done
+in software vs. handed to the panel. They share only the `rmb-pixel-core` scaffolding
+(RGBA surface, dirty-rect plumbing, gamma LUT helpers, the `PixelPipeline` trait).
+
+**Both are launch priorities, developed sequentially:** ship the **mono renderer first**
+(it also covers Pure and RM2 and is the simpler, fully-documented case), then build the
+**color renderer reusing as much of the mono scaffolding and the §7 FSM as possible**.
+Mono is therefore both a product target and the proving ground for the shared core that
+color builds on.
 
 ### 8.1 Mono panels (Pure, RM2) — grayscale dithering
 ~16 grey levels, no hardware dither. Two tiers:
@@ -555,7 +570,7 @@ capability registry defines per API `{ Absent | Stub-reject | Static-fallback }`
 | **Double-dithering** muddiness on Gallery 3 | MED | **HIGH** | Conservative palette-aware quantization; let panel self-dither; grayscale reader option |
 | Refresh-mode FSM "feels instant" (now with color axis) | MED | MED | On-device tuning pass (§18); hysteresis |
 | A2/DU ghosting management | MED | MED | Ghost budget + GC16/INIT flush + white-frame padding |
-| RM2 build (armv7 + rm2fb + 1 GB) | MED | MED | Optional, behind features; default to drop or NetSurf reader |
+| **RM2 = WPE on armv7 + rm2fb in 1 GB** (Option C) | MED | **HIGH** | Validate the 1 GB memory budget early; aggressive WPE caps, single-tab, reader-default, mono-only; NetSurf (Option B) as contingency |
 | Readability extraction on messy pages | MED | MED | Reuse Mozilla algorithm; default-in |
 | Link extraction (rel/landmarks/text) | MED | MED | Injected JS / JSC DOM walk; locale-limited heuristics |
 | Virtual-button orientation anchoring + event capture | MED | LOW | Clear hit-test ordering; re-projection math |
@@ -577,17 +592,20 @@ capability registry defines per API `{ Absent | Stub-reject | Static-fallback }`
 - **Phase 2 — WPE integration + logins.** aarch64 WPE build; headless backend → compositor;
   RAM caps; cookies/TLS policy (`rmb-net`); zoom; basic forms/login. *Exit:* a real login
   page renders and submits.
-- **Phase 3 — Color (Gallery 3).** `PixelPipeline::Color`; reverse-engineer/validate color
-  waveforms on Pro/Move; conservative quantization; color in the FSM (static-paint only).
-  *Exit:* color pages render cleanly without muddiness; scroll stays mono-fast.
+- **Phase 3 — Color renderer (Gallery 3), reusing the mono core.** Build `rmb-pixel-color`
+  on the shared scaffolding + §7 FSM; reverse-engineer/validate color waveforms and
+  panel/controller-side dithering on Pro/Move; gamut-map host-side, push dithering to the
+  hardware (§8.2); color in the FSM (static-paint only). *Exit:* color pages render cleanly
+  without muddiness; scroll stays mono-fast. (Launch priority alongside mono, built second.)
 - **Phase 4 — Viewer UX.** Virtual buttons (placement, actions, orientation anchoring,
   toggle); link drawer + fast-nav; reader mode + stylesheet + controls; TOC/landmark jump;
   frontlight control.
 - **Phase 5 — Bookmarks & polish.** Netscape-HTML + Chromium-JSON importers (+ optional
   places.sqlite); hi-fi redraw & sustained hi-fi; capability registry / graceful-degradation
   pass; config UI.
-- **RM2 (optional, parallel/late):** armv7 + rm2fb build behind features; Option A (drop),
-  B (NetSurf reader), or C (WPE-armv7) per §3 decision.
+- **RM2 bring-up (Option C, run early as a memory spike then finished late):** armv7 + rm2fb
+  + WPE + mono behind features. Do a Phase-0/1 spike to confirm WPE fits 1 GB (gating the
+  Option C vs B decision), then complete and harden alongside Phases 4–5.
 - **Later (flagged):** content-adaptive per-tile waveforms; per-panel color profiles; TTS
   if hardware supports; additional locales for nav heuristics; GPU offload *only if* a
   future reMarkable ships an ES3.1+ GPU.
@@ -599,10 +617,12 @@ capability registry defines per API `{ Absent | Stub-reject | Static-fallback }`
 1. **Engine:** WPE (open, logins, heavy C++) vs Ultralight (best e-ink fit, paid/closed
    ~$3k/yr, no static-link on free tier) vs Blitz (pure Rust, no logins). Default: WPE,
    behind a trait. *If logins are dropped, Blitz makes it end-to-end Rust.* — Phase 2.
-2. **RM2 disposition:** Drop (recommended) / NetSurf reader / WPE-armv7. Default: drop
-   unless demand. — late, low-risk.
-3. **Color scope:** is color a launch requirement, or can Pro/Move ship grayscale-first
-   (treating them like Pure) with color added in Phase 3? — affects Phase ordering.
+2. **RM2 disposition:** *DECIDED — keep via Option C* (WPE on armv7 + rm2fb, mono). Only
+   open sub-question: the early 1 GB spike result; fall back to Option B (NetSurf) if WPE
+   can't fit. — Phase 0/1 spike.
+3. **Color scope:** *DECIDED — color is a launch priority*, but the color renderer is built
+   **second**, reusing the mono core (Phase 3). Mono ships first as both a product target
+   (Pure, RM2) and the shared foundation.
 4. **Login realism:** accept "best-effort, may fail for some providers (fingerprinting/
    passkeys)." — Phase 2.
 5. **Refresh constants** — set by the Phase 1 on-device tuning pass.
