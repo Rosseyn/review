@@ -1,0 +1,13 @@
+[package]
+name = "rmb-hal"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rmb-types = { path = "../rmb-types" }
+rmb-display = { path = "../rmb-display" }
