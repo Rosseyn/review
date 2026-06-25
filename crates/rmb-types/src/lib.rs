@@ -104,4 +104,42 @@ impl Device {
     pub const fn needs_rm2fb(self) -> bool {
         matches!(self, Device::Rm2)
     }
+
+    /// The backing framebuffer pixel format. RM2's rm2fb shm is RGB565; the primary
+    /// devices' EPDC framebuffer format is to be confirmed on-device (assume RGB565).
+    pub const fn framebuffer_format(self) -> PanelFormat {
+        PanelFormat::Rgb565
+    }
+}
+
+/// Pixel format of the backing framebuffer we write into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelFormat {
+    /// 8-bit greyscale, one byte per pixel.
+    Y8,
+    /// 16-bit RGB565, little-endian, two bytes per pixel (rm2fb `/swtfb.01`).
+    Rgb565,
+}
+
+impl PanelFormat {
+    pub const fn bytes_per_pixel(self) -> usize {
+        match self {
+            PanelFormat::Y8 => 1,
+            PanelFormat::Rgb565 => 2,
+        }
+    }
+
+    /// Pack an 8-bit grey value into this format's bytes (little-endian).
+    pub fn pack_grey(self, grey: u8) -> [u8; 2] {
+        match self {
+            PanelFormat::Y8 => [grey, 0],
+            PanelFormat::Rgb565 => {
+                let r = (grey >> 3) as u16;
+                let g = (grey >> 2) as u16;
+                let b = (grey >> 3) as u16;
+                let v = (r << 11) | (g << 5) | b;
+                v.to_le_bytes()
+            }
+        }
+    }
 }
